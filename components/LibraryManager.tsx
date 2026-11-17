@@ -1,6 +1,7 @@
 "use client";
 
 import { useState } from "react";
+import { RecommendationsPanel } from "./RecommendationsPanel";
 
 export interface Book {
   id: number;
@@ -1459,20 +1460,10 @@ export function LibraryManager({ initialBooks }: { initialBooks: Book[] }) {
       {/* PANTALLA 3: RECOMENDACIONES CON GEMINI (PASO 5)                       */}
       {/* ===================================================================== */}
       {screen === "gemini" && (
-        <section className="bg-zinc-900/70 border border-zinc-800 rounded-2xl p-8 text-center space-y-3">
-          <span className="inline-block px-3 py-1 text-xs rounded-full bg-zinc-800 text-zinc-300">
-            Paso 5 · Motor de recomendaciones
-          </span>
-          <h2 className="text-xl font-semibold text-zinc-100">
-            Recomendaciones personalizadas con Gemini
-          </h2>
-          <p className="text-sm text-zinc-400 max-w-xl mx-auto">
-            Aquí conectaremos la API de Gemini para analizar tus{" "}
-            <strong className="text-zinc-200">{books.length}</strong> libros
-            registrados, tus calificaciones y tus notas personales —sin enviar
-            ningún dato personal— para sugerirte tus próximas lecturas.
-          </p>
-        </section>
+        <RecommendationsPanel
+          books={books}
+          onBookAdded={(newBook) => setBooks((prev) => [newBook, ...prev])}
+          />
       )}
 
       {/* ===================================================================== */}
