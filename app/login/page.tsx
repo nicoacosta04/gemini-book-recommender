@@ -1,9 +1,19 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
 import { authClient } from "@/lib/auth-client";
 import { GoogleSignInButton } from "@/components/GoogleSignInButton";
+
+const OAUTH_ERROR_MESSAGES: Record<string, string> = {
+  account_not_linked:
+    "Ya existe una cuenta con este correo. Inicia sesión con tu contraseña o intenta de nuevo.",
+  access_denied: "Cancelaste el inicio de sesión con Google.",
+  FORBIDDEN:
+    "Este correo no está autorizado en la lista de acceso de esta biblioteca.",
+  unable_to_create_user:
+    "Este correo no está autorizado para acceder a esta biblioteca.",
+};
 
 export default function LoginPage() {
   const router = useRouter();
@@ -13,6 +23,17 @@ export default function LoginPage() {
   const [password, setPassword] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
+
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    const urlError = params.get("error");
+    if (urlError) {
+      setError(
+        OAUTH_ERROR_MESSAGES[urlError] ||
+          `No se pudo completar el acceso con Google (${urlError}).`
+      );
+    }
+  }, []);
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
