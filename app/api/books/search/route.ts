@@ -1,8 +1,7 @@
-import { headers } from "next/headers";
 import { NextResponse } from "next/server";
-import { auth } from "@/lib/auth";
+import { getGuardedSession } from "@/lib/session-guard";
 
-export interface SearchBookResult {
+interface SearchBookResult {
   id: string;
   source: "google" | "openlibrary";
   title: string;
@@ -12,25 +11,16 @@ export interface SearchBookResult {
 }
 
 interface GoogleVolumeItem {
-  id: string;
+  id?: string;
   volumeInfo?: {
     title?: string;
-    subtitle?: string;
     authors?: string[];
     categories?: string[];
-    language?: string;
     imageLinks?: {
       thumbnail?: string;
       smallThumbnail?: string;
     };
   };
-}
-
-interface OpenLibraryEdition {
-  key?: string;
-  title?: string;
-  cover_i?: number;
-  language?: string[];
 }
 
 interface OpenLibraryDoc {
@@ -39,239 +29,134 @@ interface OpenLibraryDoc {
   author_name?: string[];
   subject?: string[];
   cover_i?: number;
-  editions?: {
-    docs?: OpenLibraryEdition[];
-  };
 }
 
-function normalizeText(str: string): string {
-  return str
-    .toLowerCase()
-    .normalize("NFD")
-    .replace(/[\u0300-\u036f]/g, "")
-    .replace(/[^a-z0-9\s]/g, " ")
-    .replace(/\s+/g, " ")
-    .trim();
-}
-
-function hasNonLatinScript(text: string): boolean {
-  // Detecta cirílico, árabe, chino, japonés, coreano, griego, etc.
-  return /[\u0400-\u04FF\u0600-\u06FF\u4E00-\u9FFF\u3040-\u30FF\uAC00-\uD7AF\u0370-\u03FF]/.test(
-    text
-  );
-}
-
-function scoreResult(
-  item: SearchBookResult & { language?: string },
-  query: string,
-  queryIsLatin: boolean
-): number {
-  let score = 0;
-  const normQuery = normalizeText(query);
-  const normTitle = normalizeText(item.title);
-  const normFull = normalizeText(`${item.title} ${item.authors.join(" ")}`);
-
-  if (queryIsLatin && hasNonLatinScript(item.title)) {
-    score -= 100;
-  }
-
-  if (normTitle === normQuery) {
-    score += 60;
-  } else if (normQuery.length >= 3 && normTitle.includes(normQuery)) {
-    score += 40;
-  }
-
-  const tokens = normQuery.split(" ").filter((t) => t.length > 1);
-  if (tokens.length > 0 && tokens.every((t) => normFull.includes(t))) {
-    score += 25;
-  }
-
-  if (item.language === "es" || item.language === "spa") {
-    score += 15;
-  }
-
-  if (item.thumbnail) {
-    score += 8;
-  }
-
-  return score;
-}
-
-async function fetchGoogleBooks(
-  query: string,
-  langRestrict?: string,
-  maxResults = 12
-): Promise<(SearchBookResult & { language?: string })[]> {
-  const apiKeyParam = process.env.GOOGLE_BOOKS_API_KEY
-    ? `&key=${encodeURIComponent(process.env.GOOGLE_BOOKS_API_KEY)}`
-    : "";
-  const langParam = langRestrict ? `&langRestrict=${langRestrict}` : "";
+async function searchGoogleBooks(query: string): Promise<SearchBookResult[]> {
   const url = `https://www.googleapis.com/books/v1/volumes?q=${encodeURIComponent(
     query
-  )}&maxResults=${maxResults}&printType=books${langParam}${apiKeyParam}`;
+  )}&maxResults=10&printType=books`;
 
   const res = await fetch(url, {
-    headers: {
-      "User-Agent": "Mozilla/5.0 (compatible; BookRecommender/1.0)",
-      Accept: "application/json",
-    },
+    signal: AbortSignal.timeout(8000),
     cache: "no-store",
   });
 
-  if (!res.ok) return [];
+  if (!res.ok) {
+    throw new Error(`Google Books HTTP ${res.status}`);
+  }
 
-  const data = await res.json();
-  if (!Array.isArray(data.items)) return [];
+  const data = (await res.json()) as { items?: GoogleVolumeItem[] };
+  const items = Array.isArray(data.items) ? data.items : [];
 
-  return data.items.map((item: GoogleVolumeItem) => {
-    const info = item.volumeInfo || {};
-    const rawThumb =
-      info.imageLinks?.thumbnail || info.imageLinks?.smallThumbnail || null;
-    return {
-      id: item.id,
-      source: "google" as const,
-      title: info.title || "Sin título",
-      authors: info.authors || ["Autor desconocido"],
-      category: info.categories?.[0] || null,
-      thumbnail: rawThumb ? rawThumb.replace(/^http:/, "https:") : null,
-      language: info.language,
-    };
-  });
+  return items
+    .map((item): SearchBookResult | null => {
+      const info = item.volumeInfo;
+      const title = info?.title?.trim();
+      if (!item.id || !title) return null;
+
+      const rawThumb =
+        info?.imageLinks?.thumbnail || info?.imageLinks?.smallThumbnail || null;
+      const thumbnail = rawThumb
+        ? rawThumb.replace(/^http:\/\//i, "https://")
+        : null;
+
+      return {
+        id: item.id,
+        source: "google",
+        title,
+        authors:
+          Array.isArray(info?.authors) && info.authors.length > 0
+            ? info.authors
+            : ["Autor desconocido"],
+        category:
+          Array.isArray(info?.categories) && info.categories.length > 0
+            ? info.categories[0]
+            : null,
+        thumbnail,
+      };
+    })
+    .filter((item): item is SearchBookResult => item !== null);
 }
 
-async function fetchOpenLibrary(
-  query: string
-): Promise<(SearchBookResult & { language?: string })[]> {
+async function searchOpenLibrary(query: string): Promise<SearchBookResult[]> {
   const url = `https://openlibrary.org/search.json?q=${encodeURIComponent(
     query
-  )}&lang=es&limit=12&fields=key,title,author_name,subject,cover_i,editions,editions.key,editions.title,editions.cover_i,editions.language`;
+  )}&limit=10`;
 
   const res = await fetch(url, {
-    headers: {
-      "User-Agent": "BookRecommenderApp/1.0 (personal-library)",
-      Accept: "application/json",
-    },
+    signal: AbortSignal.timeout(8000),
     cache: "no-store",
   });
 
-  if (!res.ok) return [];
+  if (!res.ok) {
+    throw new Error(`Open Library HTTP ${res.status}`);
+  }
 
-  const data = await res.json();
-  const docs: OpenLibraryDoc[] = Array.isArray(data.docs) ? data.docs : [];
-  const results: (SearchBookResult & { language?: string })[] = [];
+  const data = (await res.json()) as { docs?: OpenLibraryDoc[] };
+  const docs = Array.isArray(data.docs) ? data.docs : [];
 
-  for (const doc of docs) {
-    const authors = doc.author_name || ["Autor desconocido"];
-    const category = doc.subject?.[0] || null;
-    const subEditions = doc.editions?.docs || [];
+  return docs
+    .map((doc): SearchBookResult | null => {
+      const title = doc.title?.trim();
+      const key = doc.key?.trim();
+      if (!title || !key) return null;
 
-    // Extraer ediciones en español o con título latino si existen
-    const matchingEditions = subEditions.filter(
-      (ed) =>
-        ed.title &&
-        (!hasNonLatinScript(ed.title) || ed.language?.includes("spa"))
-    );
-
-    if (matchingEditions.length > 0) {
-      for (const ed of matchingEditions.slice(0, 3)) {
-        const coverId = ed.cover_i || doc.cover_i;
-        results.push({
-          id: ed.key || doc.key || crypto.randomUUID(),
-          source: "openlibrary",
-          title: ed.title!,
-          authors,
-          category,
-          thumbnail: coverId
-            ? `https://covers.openlibrary.org/b/id/${coverId}-M.jpg`
-            : null,
-          language: ed.language?.[0] || "spa",
-        });
-      }
-    } else if (doc.title) {
-      results.push({
-        id: doc.key || crypto.randomUUID(),
+      return {
+        id: key.replace(/^\/works\//, ""),
         source: "openlibrary",
-        title: doc.title,
-        authors,
-        category,
+        title,
+        authors:
+          Array.isArray(doc.author_name) && doc.author_name.length > 0
+            ? doc.author_name
+            : ["Autor desconocido"],
+        category:
+          Array.isArray(doc.subject) && doc.subject.length > 0
+            ? doc.subject[0]
+            : null,
         thumbnail: doc.cover_i
           ? `https://covers.openlibrary.org/b/id/${doc.cover_i}-M.jpg`
           : null,
-      });
-    }
-  }
-
-  return results;
+      };
+    })
+    .filter((item): item is SearchBookResult => item !== null);
 }
 
 export async function GET(request: Request) {
-  const session = await auth.api.getSession({ headers: await headers() });
-  if (!session) {
+  const user = await getGuardedSession();
+  if (!user) {
     return NextResponse.json({ error: "No autorizado" }, { status: 401 });
+  }
+  if (!user.approved) {
+    return NextResponse.json(
+      { error: "Tu cuenta está pendiente de aprobación." },
+      { status: 403 }
+    );
   }
 
   const { searchParams } = new URL(request.url);
-  const query = (searchParams.get("q") || "").trim();
+  const query = String(searchParams.get("q") || "").trim();
 
   if (!query) {
     return NextResponse.json({ results: [] });
   }
 
-  const queryIsLatin = !hasNonLatinScript(query);
+  try {
+    const googleResults = await searchGoogleBooks(query);
+    if (googleResults.length > 0) {
+      return NextResponse.json({ results: googleResults });
+    }
+  } catch (err) {
+    console.warn("Google Books falló, usando respaldo Open Library:", err);
+  }
 
   try {
-    // Consultar Google Books (priorizando español + general) y Open Library en paralelo
-    const [googleEs, googleAny, openLib] = await Promise.all([
-      fetchGoogleBooks(query, "es", 12),
-      fetchGoogleBooks(query, undefined, 8),
-      fetchOpenLibrary(query),
-    ]);
-
-    const combined = [...googleEs, ...googleAny, ...openLib];
-
-    // Filtrar títulos en alfabetos no latinos si la búsqueda fue en español/latino y hay alternativas válidas
-    const latinFiltered = queryIsLatin
-      ? combined.filter((item) => !hasNonLatinScript(item.title))
-      : combined;
-
-    const poolToRank = latinFiltered.length > 0 ? latinFiltered : combined;
-
-    // Ordenar por relevancia, idioma español y disponibilidad de portada
-    const ranked = poolToRank.sort(
-      (a, b) =>
-        scoreResult(b, query, queryIsLatin) -
-        scoreResult(a, query, queryIsLatin)
-    );
-
-    // Deduplicar ediciones idénticas (mismo título + autor + portada)
-    const seen = new Set<string>();
-    const uniqueResults: SearchBookResult[] = [];
-
-    for (const item of ranked) {
-      const key = `${normalizeText(item.title)}|${normalizeText(
-        item.authors[0] || ""
-      )}|${item.thumbnail || "no-cover"}`;
-      if (seen.has(key)) continue;
-      seen.add(key);
-
-      uniqueResults.push({
-        id: item.id,
-        source: item.source,
-        title: item.title,
-        authors: item.authors,
-        category: item.category,
-        thumbnail: item.thumbnail,
-      });
-
-      if (uniqueResults.length >= 12) break;
-    }
-
-    return NextResponse.json({ results: uniqueResults });
-  } catch (error) {
-    console.error("Error en búsqueda de libros:", error);
+    const fallbackResults = await searchOpenLibrary(query);
+    return NextResponse.json({ results: fallbackResults });
+  } catch (err) {
+    console.error("Error consultando catálogos de libros:", err);
     return NextResponse.json(
-      { error: "No se pudo consultar el catálogo de libros." },
-      { status: 500 }
+      { error: "No se pudo consultar el catálogo en este momento." },
+      { status: 502 }
     );
   }
 }

@@ -1,24 +1,30 @@
-import { headers } from "next/headers";
 import { NextResponse } from "next/server";
 import { GoogleGenAI, Type } from "@google/genai";
-import { auth } from "@/lib/auth";
+import { getGuardedSession } from "@/lib/session-guard";
 import { pool } from "@/lib/db";
 
 interface DbBookRow {
   title: string;
   author: string;
   genre: string | null;
-  status: "read" | "reading" | "wishlist" | "abandoned";
+  status: "read" | "reading" | "to_read" | "wishlist" | "abandoned";
   rating: number | null;
   notes: string | null;
+  priority: "high" | "medium" | "low";
+  estimated_price: number | null;
 }
 
-// Modelos activos confirmados en tu cuenta, ordenados de mayor velocidad a mayor capacidad
 const ACTIVE_MODELS = [
   "gemini-3.5-flash-lite",
   "gemini-3.5-flash",
   "gemini-3.8-flash",
 ] as const;
+
+const PRIORITY_LABELS: Record<string, string> = {
+  high: "Prioridad ALTA",
+  medium: "Prioridad MEDIA",
+  low: "Prioridad BAJA",
+};
 
 async function callModelFast(
   ai: GoogleGenAI,
@@ -41,7 +47,6 @@ async function callModelFast(
         ? Number((err as { status?: unknown }).status)
         : 0;
 
-    // Si el modelo rechaza thinkingBudget: 0 (400), reintenta sin ese parámetro
     if (status === 400) {
       return await ai.models.generateContent({
         model,
@@ -54,18 +59,21 @@ async function callModelFast(
 }
 
 export async function POST(request: Request) {
-  const session = await auth.api.getSession({ headers: await headers() });
-  if (!session) {
+  const user = await getGuardedSession();
+  if (!user) {
     return NextResponse.json({ error: "No autorizado" }, { status: 401 });
+  }
+  if (!user.approved) {
+    return NextResponse.json(
+      { error: "Tu cuenta está pendiente de aprobación." },
+      { status: 403 }
+    );
   }
 
   const apiKey = process.env.GEMINI_API_KEY;
   if (!apiKey) {
     return NextResponse.json(
-      {
-        error:
-          "Falta configurar GEMINI_API_KEY en el archivo .env.local del proyecto.",
-      },
+      { error: "Falta configurar GEMINI_API_KEY en el servidor." },
       { status: 500 }
     );
   }
@@ -73,17 +81,25 @@ export async function POST(request: Request) {
   try {
     const body = await request.json().catch(() => ({}));
     const mood = String(body.mood || "").trim().slice(0, 300);
-    const mode: "discover" | "wishlist" =
-      body.mode === "wishlist" ? "wishlist" : "discover";
+    const mode: "discover" | "to_read" | "purchase_optimize" =
+      body.mode === "to_read"
+        ? "to_read"
+        : body.mode === "purchase_optimize"
+        ? "purchase_optimize"
+        : "discover";
     const count = body.count === 5 ? 5 : 3;
+    const rawBudget = Number(body.budget);
+    const budget =
+      mode === "purchase_optimize" && !Number.isNaN(rawBudget) && rawBudget > 0
+        ? rawBudget
+        : null;
 
-    // 1. Leer únicamente metadatos literarios del usuario (sin datos personales)
     const result = await pool.query<DbBookRow>(
-      `SELECT title, author, genre, status, rating, notes
+      `SELECT title, author, genre, status, rating, notes, priority, estimated_price
        FROM books
        WHERE user_id = $1
        ORDER BY rating DESC NULLS LAST, created_at DESC`,
-      [session.user.id]
+      [user.id]
     );
 
     const books = result.rows;
@@ -98,22 +114,39 @@ export async function POST(request: Request) {
       );
     }
 
+    const toReadBooks = books.filter((b) => b.status === "to_read");
     const wishlistBooks = books.filter((b) => b.status === "wishlist");
-    if (mode === "wishlist" && wishlistBooks.length === 0) {
+
+    if (mode === "to_read" && toReadBooks.length === 0) {
       return NextResponse.json(
         {
           error:
-            "No tienes libros marcados como 'Por leer' en tu biblioteca todavía.",
+            "No tienes libros marcados como 'Por leer (En casa)' todavía.",
         },
         { status: 400 }
       );
     }
 
-    // 2. Contexto compacto y anonimizado
-    const formatBook = (b: DbBookRow) => {
+    if (mode === "purchase_optimize" && wishlistBooks.length === 0) {
+      return NextResponse.json(
+        {
+          error:
+            "No tienes libros en tu lista 'Por comprar' todavía.",
+        },
+        { status: 400 }
+      );
+    }
+
+    const formatBook = (b: DbBookRow, includePurchaseMeta = false) => {
       const parts = [`"${b.title}" (${b.author})`];
       if (b.genre) parts.push(`[${b.genre}]`);
       if (b.rating) parts.push(`[${b.rating}/5★]`);
+      if (includePurchaseMeta) {
+        parts.push(`[${PRIORITY_LABELS[b.priority] || "Prioridad MEDIA"}]`);
+        if (b.estimated_price !== null) {
+          parts.push(`[Precio est.: $${Number(b.estimated_price).toLocaleString("es-CO")}]`);
+        }
+      }
       if (b.notes) parts.push(`Nota: "${b.notes}"`);
       return `- ${parts.join(" ")}`;
     };
@@ -130,27 +163,42 @@ export async function POST(request: Request) {
       (b) => b.status === "abandoned" || (b.rating !== null && b.rating <= 2)
     );
 
-    const ownedTitles = books.map((b) => `"${b.title}"`).join(", ");
+    const excludedTitles = books.map((b) => `"${b.title}"`).join(", ");
+
+    let taskPrompt = "";
+    if (mode === "discover") {
+      taskPrompt = `Recomienda ${count} libros nuevos en español que NO estén entre estos títulos ya registrados: ${excludedTitles}.`;
+    } else if (mode === "to_read") {
+      taskPrompt = `Elige y ordena hasta ${Math.min(
+        count,
+        toReadBooks.length
+      )} libros ÚNICAMENTE de esta lista de libros YA COMPRADOS que el lector tiene en casa esperando lectura:\n${toReadBooks
+        .map((b) => formatBook(b, false))
+        .join("\n")}`;
+    } else {
+      const budgetRule = budget
+        ? `Presupuesto máximo disponible para esta compra: $${budget.toLocaleString("es-CO")} COP. Procura que la suma de precios estimados conocidos no supere ese presupuesto.`
+        : "No hay tope fijo de presupuesto, pero optimiza relación prioridad / afinidad literaria / precio.";
+      taskPrompt = `Actúa como asesor de compras literarias. De esta lista 'Por comprar', selecciona y ordena hasta ${Math.min(
+        count,
+        wishlistBooks.length
+      )} libros para comprar primero. ${budgetRule}\nLista 'Por comprar':\n${wishlistBooks
+        .map((b) => formatBook(b, true))
+        .join("\n")}`;
+    }
 
     const promptSections = [
       favorites.length > 0
-        ? `FAVORITOS:\n${favorites.map(formatBook).join("\n")}`
+        ? `FAVORITOS:\n${favorites.map((b) => formatBook(b)).join("\n")}`
         : "",
       otherRead.length > 0
-        ? `OTROS LEÍDOS:\n${otherRead.map(formatBook).join("\n")}`
+        ? `OTROS LEÍDOS:\n${otherRead.map((b) => formatBook(b)).join("\n")}`
         : "",
       avoided.length > 0
-        ? `EVITAR ESTILOS SIMILARES A:\n${avoided.map(formatBook).join("\n")}`
+        ? `EVITAR ESTILOS SIMILARES A:\n${avoided.map((b) => formatBook(b)).join("\n")}`
         : "",
       mood ? `PETICIÓN DEL LECTOR: "${mood}"` : "",
-      mode === "discover"
-        ? `Recomienda ${count} libros en español que NO estén entre estos títulos ya poseídos: ${ownedTitles}.`
-        : `Elige y ordena hasta ${Math.min(
-            count,
-            wishlistBooks.length
-          )} libros ÚNICAMENTE de esta lista 'Por leer':\n${wishlistBooks
-            .map(formatBook)
-            .join("\n")}`,
+      taskPrompt,
     ].filter(Boolean);
 
     const ai = new GoogleGenAI({
@@ -160,8 +208,8 @@ export async function POST(request: Request) {
 
     const baseConfig = {
       systemInstruction:
-        "Eres un curador literario conciso y preciso. Responde en español directo, conectando cada libro con las calificaciones y notas del lector.",
-      maxOutputTokens: 900,
+        "Eres un curador literario conciso y preciso. Responde en español directo, conectando cada libro con las calificaciones, notas, prioridades y presupuesto del lector.",
+      maxOutputTokens: 950,
       temperature: 0.7,
       responseMimeType: "application/json",
       responseSchema: {
@@ -169,7 +217,8 @@ export async function POST(request: Request) {
         properties: {
           readerProfileSummary: {
             type: Type.STRING,
-            description: "Resumen de 1 a 2 oraciones del perfil lector.",
+            description:
+              "Resumen de 1 a 2 oraciones del perfil lector o estrategia de compra recomendada.",
           },
           recommendations: {
             type: Type.ARRAY,
@@ -181,11 +230,12 @@ export async function POST(request: Request) {
                 genre: { type: Type.STRING },
                 reason: {
                   type: Type.STRING,
-                  description: "Por qué encaja con el lector (1-2 oraciones).",
+                  description: "Por qué encaja o por qué priorizarlo ahora (1-2 oraciones).",
                 },
                 connectionToLibrary: {
                   type: Type.STRING,
-                  description: "Vínculo breve con libros o notas de su biblioteca.",
+                  description:
+                    "Vínculo breve con su biblioteca, prioridad o presupuesto.",
                 },
               },
               required: [
@@ -204,17 +254,13 @@ export async function POST(request: Request) {
 
     let lastError: unknown;
     for (const model of ACTIVE_MODELS) {
-      const start = Date.now();
       try {
-        console.log(`[Gemini] Consultando ${model}...`);
         const response = await callModelFast(
           ai,
           model,
           promptSections.join("\n\n"),
           baseConfig
         );
-        const elapsed = ((Date.now() - start) / 1000).toFixed(1);
-        console.log(`[Gemini] Listo con ${model} en ${elapsed}s`);
 
         const parsed = JSON.parse(response.text || "{}");
         return NextResponse.json({
@@ -225,14 +271,6 @@ export async function POST(request: Request) {
         });
       } catch (err: unknown) {
         lastError = err;
-        const elapsed = ((Date.now() - start) / 1000).toFixed(1);
-        const status =
-          typeof err === "object" && err !== null && "status" in err
-            ? Number((err as { status?: unknown }).status)
-            : 0;
-        console.warn(
-          `[Gemini] Fallo en ${model} tras ${elapsed}s (status: ${status || "timeout"})`
-        );
       }
     }
 
